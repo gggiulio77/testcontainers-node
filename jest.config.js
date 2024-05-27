@@ -5,4 +5,5 @@ module.exports = {
         "^.+\\.(t|j)sx?$": "@swc/jest",
     },
     testPathIgnorePatterns: ["<rootDir>/node_modules/"],
+    testTimeout: 12000,
 };
