@@ -20,8 +20,18 @@ import {
     SendMessageCommand,
 } from "@aws-sdk/client-sqs";
 
+import { MongoDBContainer } from "@testcontainers/mongodb";
+import {
+    Schema,
+    disconnect as mongoDisconnect,
+    model,
+    connect as mongoConnect,
+} from "mongoose";
+
 describe("testcontainers", () => {
     it("generic image", async () => {
+        // Example with postgresql using generic container
+
         const postgresContainer = await new GenericContainer(
             "postgres:13.3-alpine"
         )
@@ -64,7 +74,7 @@ describe("testcontainers", () => {
     });
 
     it("module", async () => {
-        console.log("creating container");
+        // Example with postgresql using testcontainers module
 
         const postgresContainer = await new PostgreSqlContainer()
             .withDatabase("todos")
@@ -98,6 +108,8 @@ describe("testcontainers", () => {
     });
 
     it("localstack-s3", async () => {
+        // Example with bucket from localstack testcontainers module
+
         const Bucket = "testing";
 
         const container = await new LocalstackContainer().start();
@@ -133,9 +145,13 @@ describe("testcontainers", () => {
         expect(await getObject.Body?.transformToString()).toEqual("testing");
 
         expect(createBucket.$metadata.httpStatusCode).toEqual(200);
+
+        client.destroy();
     });
 
     it("localstack-sqs", async () => {
+        // Example with sqs from localstack generic container
+
         // must use GenericContainer to set the image version, we need 3.X to support SQS Json responses
         const container = await new GenericContainer(
             "localstack/localstack:latest"
@@ -185,6 +201,107 @@ describe("testcontainers", () => {
                 : [null];
 
         expect(message?.Body).toEqual("testing");
+
+        client.destroy();
+    });
+
+    it("mongo-sqs", async () => {
+        // Example with mongoose as mongo client and sqs from localstack generic container
+
+        const mongodbContainer = await new MongoDBContainer(
+            "mongo:7.0.9"
+        ).start();
+
+        interface IUser {
+            name: string;
+            email: string;
+            avatar?: string;
+        }
+
+        const userSchema = new Schema<IUser>({
+            name: { type: String, required: true },
+            email: { type: String, required: true },
+            avatar: String,
+        });
+
+        const User = model<IUser>("User", userSchema);
+
+        await mongoConnect(`${mongodbContainer.getConnectionString()}`, {
+            directConnection: true,
+        });
+
+        const localstack = await new GenericContainer(
+            "localstack/localstack:latest"
+        )
+            .withExposedPorts(4566)
+            .withWaitStrategy(Wait.forLogMessage("Ready", 1))
+            .withStartupTimeout(120000)
+            .start();
+
+        const client = new SQSClient({
+            endpoint: `http://localhost:${localstack.getMappedPort(4566)}`,
+            region: "us-east-1",
+            credentials: {
+                accessKeyId: "test",
+                secretAccessKey: "test",
+            },
+        });
+
+        const createQueue = await client.send(
+            new CreateQueueCommand({ QueueName: "testing" })
+        );
+
+        expect(createQueue.$metadata.httpStatusCode).toEqual(200);
+
+        const queues = await client.send(new ListQueuesCommand());
+
+        expect(queues.$metadata.httpStatusCode).toEqual(200);
+        expect(queues.QueueUrls?.length).toEqual(1);
+
+        const listener = User.watch().on("change", async (data) => {
+            // Process insert event
+
+            console.log(data);
+
+            const { email, name, avatar } = data.fullDocument;
+
+            const sendMessage = await client.send(
+                new SendMessageCommand({
+                    MessageBody: JSON.stringify({ email, name, avatar }),
+                    QueueUrl: queues.QueueUrls?.[0],
+                })
+            );
+
+            expect(sendMessage.$metadata.httpStatusCode).toEqual(200);
+
+            return;
+        });
+
+        const testUser: IUser = {
+            name: "test",
+            email: "test@test.test",
+            avatar: "test",
+        };
+
+        await User.create(testUser);
+
+        const receiveMessage = await client.send(
+            new ReceiveMessageCommand({
+                QueueUrl: queues.QueueUrls?.[0],
+                WaitTimeSeconds: 60,
+            })
+        );
+
+        const [message] =
+            receiveMessage.Messages && receiveMessage.Messages.length > 0
+                ? receiveMessage.Messages
+                : [null];
+
+        expect(JSON.parse(message?.Body as string)).toEqual(testUser);
+
+        await listener.close();
+        client.destroy();
+        await mongoDisconnect();
     });
 });
 
@@ -197,11 +314,7 @@ async function runMigrations(client: Client) {
         "20240503212727_todo.sql"
     );
 
-    console.log(`${filePath}`);
-
     const migration = (await readFile(filePath)).toString();
-
-    console.log(`Running migration, ${migration}`);
 
     await client.query(migration);
 }
